@@ -76,7 +76,8 @@ namespace statements {
 namespace {
 
 constexpr std::string_view ANN_CUSTOM_INDEX_OPTION = "vector_index";
-constexpr std::string_view FTS_CUSTOM_INDEX_OPTION = "fts_index";
+// FTS index class name is not hard-coded here; detection uses the
+// secondary_index_manager factory + dynamic_cast<fts_index*> pattern instead.
 
 template <typename Func>
 auto measure_index_latency(const schema& schema, const secondary_index::index& index, Func&& func) -> std::invoke_result_t<Func> {
@@ -2542,50 +2543,78 @@ static std::optional<fts_query_info> get_fts_query_info(
         data_dictionary::database db,
         schema_ptr schema,
         lw_shared_ptr<const raw::select_statement::parameters> parameters,
-        prepare_context& ctx) {
+        prepare_context& ctx,
+        const expr::expression& where_clause) {
 
-    // Walk the raw WHERE clause searching for a MATCH binary operator.
-    // The left-hand side must be a column name (unresolved_identifier or
-    // column_value after resolution).  We accept unresolved identifiers here
-    // because we are called before prepare_restrictions().
-    (void)ctx; // unused at this stage; kept for signature symmetry with get_ann_ordering_info
+    (void)parameters; // unused at this stage; kept for signature symmetry with get_ann_ordering_info
+    (void)ctx;
 
-    const expr::binary_operator* match_binop = nullptr;
+    // Step 1: check the raw WHERE clause for a MATCH binary operator.
+    // We must do this first — if there is no MATCH predicate this is not an
+    // FTS query at all, even if the table happens to have an FTS index.
+    const expr::binary_operator* match_binop = expr::find_binop(where_clause,
+            [](const expr::binary_operator& bo) {
+                return bo.op == expr::oper_t::MATCH;
+            });
+    if (!match_binop) {
+        return std::nullopt;
+    }
 
-    // The WHERE clause is stored on the raw::select_statement; we reach it
-    // through the per-shard prepare path that calls this function.
-    // Unfortunately raw parameters do not expose the where clause directly,
-    // so we detect FTS availability by inspecting the index manager instead.
-    // If any FTS custom index exists on the table we treat the query as a
-    // potential FTS query.  The actual MATCH predicate validation happens
-    // later in fts_indexed_table_select_statement::do_execute().
-    (void)match_binop; // populated below via the schema-level index check
+    // Step 2: extract the column name from the LHS of the MATCH operator.
+    // The LHS is still an unresolved_identifier at this point because we are
+    // called before prepare_restrictions().
+    sstring match_col_name;
+    if (auto uid = expr::as_if<expr::unresolved_identifier>(&match_binop->lhs)) {
+        auto col_id = uid->ident->prepare_column_identifier(*schema);
+        match_col_name = sstring(col_id->name().begin(), col_id->name().end());
+    } else if (auto cv = expr::as_if<expr::column_value>(&match_binop->lhs)) {
+        match_col_name = cv->col->name_as_text();
+    } else {
+        throw exceptions::invalid_request_exception(
+                "FTS MATCH operator left-hand side must be a column name");
+    }
 
+    const column_definition* match_col = schema->get_column_definition(
+            utf8_type->from_string(match_col_name));
+    if (!match_col) {
+        throw exceptions::invalid_request_exception(
+                fmt::format("Unknown column '{}' in FTS MATCH predicate", match_col_name));
+    }
+
+    // Step 3: find an FTS custom index on the target column.
+    // We use the same dynamic_cast pattern as has_fts_index_on_column() in
+    // fts_index.cc to avoid hard-coding the class name string.
     auto cf = db.find_column_family(schema);
     auto& sim = cf.get_index_manager();
     auto indexes = sim.list_indexes();
 
-    // Find an FTS custom index on this table.
-    auto it = std::find_if(indexes.begin(), indexes.end(), [](const secondary_index::index& idx) {
+    auto it = std::find_if(indexes.begin(), indexes.end(),
+            [&match_col_name](const secondary_index::index& idx) {
         const auto& opts = idx.metadata().options();
-        auto class_it = opts.find("class");
-        return class_it != opts.end() && class_it->second == std::string(FTS_CUSTOM_INDEX_OPTION);
+        // Verify this is an FTS custom index via factory + dynamic_cast.
+        auto class_it = opts.find(db::index::secondary_index::custom_class_option_name);
+        if (class_it == opts.end()) {
+            return false;
+        }
+        auto factory = secondary_index::secondary_index_manager::get_custom_class_factory(class_it->second);
+        if (!factory) {
+            return false;
+        }
+        auto instance = (*factory)();
+        if (!dynamic_cast<fts_index*>(instance.get())) {
+            return false;
+        }
+        // Verify the index targets the column named in the MATCH predicate.
+        auto target_it = opts.find(cql3::statements::index_target::target_option_name);
+        if (target_it == opts.end()) {
+            return false;
+        }
+        return target_it->second.find(match_col_name) != sstring::npos;
     });
 
     if (it == indexes.end()) {
-        // No FTS index on this table → not an FTS query.
-        return std::nullopt;
-    }
-
-    // Find the target column for the first FTS index.
-    const auto& target = it->metadata().options().find("target");
-    if (target == it->metadata().options().end()) {
-        return std::nullopt;
-    }
-
-    const column_definition* match_col = schema->get_column_definition(
-            utf8_type->from_string(target->second));
-    if (!match_col) {
+        // No FTS index on the column referenced by MATCH → not an FTS query.
+        // Let the normal restriction path handle this (it will likely error).
         return std::nullopt;
     }
 
@@ -2691,7 +2720,7 @@ std::unique_ptr<prepared_statement> select_statement::prepare(data_dictionary::d
     // on the MATCH predicate which restrictions does not yet know about.
     std::optional<fts_query_info> fts_query_info_opt;
     if (!is_ann_query) {
-        fts_query_info_opt = get_fts_query_info(db, schema, _parameters, ctx);
+        fts_query_info_opt = get_fts_query_info(db, schema, _parameters, ctx, _where_clause);
     }
     bool is_fts_query = fts_query_info_opt.has_value();
 
