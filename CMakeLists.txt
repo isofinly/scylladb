@@ -294,8 +294,9 @@ add_subdirectory(dht)
 add_subdirectory(ent)
 add_subdirectory(gms)
 add_subdirectory(idl)
-add_subdirectory(index)
-add_subdirectory(lang)
+ add_subdirectory(index)
+ add_subdirectory(fts)
+ add_subdirectory(lang)
 add_subdirectory(locator)
 add_subdirectory(message)
 add_subdirectory(mutation)
@@ -336,8 +337,9 @@ set(scylla_libs
     encryption
     gms
     idl
-    index
-    lang
+     index
+     fts
+     lang
     ldap
     locator
     message
