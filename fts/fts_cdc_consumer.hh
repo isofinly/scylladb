@@ -110,7 +110,7 @@ class fts_cdc_consumer
     : public seastar::peering_sharded_service<fts_cdc_consumer>
 {
 public:
-    fts_cdc_consumer(cql3::query_processor& qp, replica::database& db);
+    fts_cdc_consumer(seastar::sharded<cql3::query_processor>& qp, seastar::sharded<replica::database>& db);
     ~fts_cdc_consumer();
 
     // ── Lifecycle ────────────────────────────────────────────────────────
@@ -145,6 +145,12 @@ private:
 
     /// One poll tick: read CDC rows since last checkpoint and index them.
     seastar::future<> poll_cdc();
+
+    /// Scan the database for FTS-indexed tables not yet tracked and open
+    /// their shard indexes.  Called at the start of every poll cycle so
+    /// that tables created after startup are picked up without needing a
+    /// separate schema-change notification path.
+    seastar::future<> scan_for_new_fts_tables();
 
     /// Process a single CDC log table for the given base table.
     seastar::future<> poll_cdc_table(const sstring& keyspace,

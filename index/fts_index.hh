@@ -23,7 +23,7 @@ namespace db::index {
 /// `<data_dir>/fts_indexes/<ks>/<table>/<index_name>/shard-<N>/`.
 /// Writes arrive via an implicit per-table CDC log, consumed by
 /// `fts_cdc_consumer` running on a Seastar alien thread.
-class fts_index : public secondary_index::custom_index {
+class fts_index : public ::secondary_index::custom_index {
 public:
     fts_index() = default;
     ~fts_index() override = default;
@@ -104,6 +104,6 @@ private:
         int depth_limit = 3);
 };
 
-std::unique_ptr<secondary_index::custom_index> fts_index_factory();
+std::unique_ptr<::secondary_index::custom_index> fts_index_factory();
 
 } // namespace db::index

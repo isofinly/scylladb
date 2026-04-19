@@ -144,7 +144,7 @@ public:
          const query_options& options, gc_clock::time_point now, int32_t page_size, bool aggregate, bool nonpaged_filtering, uint64_t limit,
         std::optional<service::cas_shard> cas_shard) const;
 
-    future<shared_ptr<cql_transport::messages::result_message>> process_results(foreign_ptr<lw_shared_ptr<query::result>> results,
+    virtual future<shared_ptr<cql_transport::messages::result_message>> process_results(foreign_ptr<lw_shared_ptr<query::result>> results,
         lw_shared_ptr<query::read_command> cmd, const query_options& options, gc_clock::time_point now) const;
 
     const sstring& keyspace() const;
@@ -467,6 +467,15 @@ private:
             query_processor& qp,
             service::query_state& state,
             const query_options& options) const override;
+
+    /// Override process_results to skip the MATCH restriction filter.
+    /// Results fetched from the base table are already restricted to Tantivy
+    /// hits, so no further filtering on the MATCH predicate is needed.
+    future<shared_ptr<cql_transport::messages::result_message>> process_results(
+            foreign_ptr<lw_shared_ptr<query::result>> results,
+            lw_shared_ptr<query::read_command> cmd,
+            const query_options& options,
+            gc_clock::time_point now) const override;
 
     void update_stats() const;
 

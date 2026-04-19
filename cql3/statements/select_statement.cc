@@ -2309,6 +2309,108 @@ void fts_indexed_table_select_statement::update_stats() const {
             cond_selector::NO_CONDITIONS, statement_type::SELECT);
 }
 
+// Override process_results to avoid applying the MATCH restriction as a
+// post-processing boolean filter.  The rows returned from the base table are
+// already narrowed to the Tantivy-hit primary keys.
+//
+// If there are additional non-MATCH restrictions (e.g. AND status = 'active'),
+// those must still be applied row-by-row.  We replace each MATCH
+// binary_operator node with constant-true before evaluating so that
+// expr::is_satisfied_by never tries to evaluate the MATCH predicate.
+future<shared_ptr<cql_transport::messages::result_message>>
+fts_indexed_table_select_statement::process_results(
+        foreign_ptr<lw_shared_ptr<query::result>> results,
+        lw_shared_ptr<query::read_command> cmd,
+        const query_options& options,
+        gc_clock::time_point now) const
+{
+    // Determine whether any non-MATCH restrictions need post-query filtering.
+    bool has_non_match_restrictions = false;
+    if (_restrictions_need_filtering) {
+        auto is_non_match_binop = [](const expr::binary_operator& bo) {
+            return bo.op != expr::oper_t::MATCH;
+        };
+        has_non_match_restrictions =
+            expr::find_binop(_restrictions->get_partition_level_filter(),   is_non_match_binop) != nullptr ||
+            expr::find_binop(_restrictions->get_clustering_row_level_filter(), is_non_match_binop) != nullptr;
+    }
+
+    cql3::selection::result_set_builder builder(*_selection, now, &options);
+    co_return co_await builder.with_thread_if_needed([&] {
+        if (has_non_match_restrictions) {
+            // Replace every MATCH binary_operator node with constant-true so that
+            // is_satisfied_by() does not throw when called row-by-row.
+            auto replace_match_with_true =
+                    [](const expr::expression& e) -> std::optional<expr::expression> {
+                const auto* bo = expr::as_if<expr::binary_operator>(&e);
+                if (bo && bo->op == expr::oper_t::MATCH) {
+                    return expr::constant::make_bool(true);
+                }
+                return std::nullopt;
+            };
+            expr::expression modified_part_filter = expr::search_and_replace(
+                    _restrictions->get_partition_level_filter(), replace_match_with_true);
+            expr::expression modified_ck_filter = expr::search_and_replace(
+                    _restrictions->get_clustering_row_level_filter(), replace_match_with_true);
+
+            // Inline filter struct that evaluates the modified expressions.
+            // Stores owned expressions (not references) so lifetime is safe.
+            struct match_stripped_filter {
+                expr::expression part_filter;
+                expr::expression ck_filter;
+                const query_options& options;
+
+                bool operator()(const cql3::selection::selection& sel,
+                                const std::vector<bytes>& pk,
+                                const std::vector<bytes>& ck,
+                                const query::result_row_view& static_row,
+                                const query::result_row_view* row) const {
+                    auto col_vals = expr::get_non_pk_values(sel, static_row, row);
+                    expr::evaluation_inputs inputs{
+                        .partition_key = pk,
+                        .clustering_key = ck,
+                        .static_and_regular_columns = col_vals,
+                        .selection = &sel,
+                        .options = &options,
+                    };
+                    return expr::is_satisfied_by(part_filter, inputs) &&
+                           expr::is_satisfied_by(ck_filter, inputs);
+                }
+
+                void reset(const partition_key* = nullptr) {}
+                uint64_t get_rows_dropped() const { return 0; }
+            };
+
+            results->ensure_counts();
+            _stats.filtered_rows_read_total += *results->row_count();
+            query::result_view::consume(*results, cmd->slice,
+                    cql3::selection::result_set_builder::visitor(builder, *_query_schema,
+                            *_selection,
+                            match_stripped_filter{
+                                std::move(modified_part_filter),
+                                std::move(modified_ck_filter),
+                                options}));
+        } else {
+            // No non-MATCH restrictions — rows are already fully filtered by
+            // Tantivy; use the fast no-filter path.
+            query::result_view::consume(*results, cmd->slice,
+                    cql3::selection::result_set_builder::visitor(builder, *_query_schema,
+                            *_selection));
+        }
+        auto rs = builder.build();
+        if (needs_post_query_ordering()) {
+            rs->sort(_ordering_comparator);
+            if (_is_reversed) {
+                rs->reverse();
+            }
+            rs->trim(cmd->get_row_limit());
+        }
+        update_stats_rows_read(rs->size());
+        return shared_ptr<cql_transport::messages::result_message>(
+                ::make_shared<cql_transport::messages::result_message::rows>(result(std::move(rs))));
+    });
+}
+
 lw_shared_ptr<query::read_command>
 fts_indexed_table_select_statement::prepare_command_for_base_query(
         query_processor& qp,
@@ -2349,21 +2451,28 @@ fts_indexed_table_select_statement::do_execute(
                             "LIMIT was {}", max_fts_query_limit, limit)));
     }
 
-    // Extract the MATCH query string from the WHERE clause bind value.
-    // We look for a binary_operator with op == oper_t::MATCH in the
-    // (already-prepared) restrictions expression.
+    // Extract the MATCH query string from prepared non-PK restrictions.
+    // Keep this tied to the specific column detected at prepare() time.
     sstring match_query;
-    expr::visit(overloaded_functor{
-        [&](const expr::binary_operator& bo) {
-            if (bo.op == expr::oper_t::MATCH) {
-                auto val = expr::evaluate(bo.rhs, options);
-                if (!val.is_null()) {
-                    match_query = val.as<sstring>();
-                }
+    const auto& non_pk_restrictions = _restrictions->get_non_pk_restriction();
+    if (auto it = non_pk_restrictions.find(_match_column); it != non_pk_restrictions.end()) {
+        const expr::binary_operator* match_predicate = expr::find_binop(
+                it->second,
+                [this](const expr::binary_operator& bo) {
+                    if (bo.op != expr::oper_t::MATCH) {
+                        return false;
+                    }
+                    const auto* lhs_col = expr::as_if<expr::column_value>(&bo.lhs);
+                    return lhs_col && lhs_col->col == _match_column;
+                });
+
+        if (match_predicate) {
+            auto val = expr::evaluate(match_predicate->rhs, options);
+            if (!val.is_null()) {
+                match_query = utf8_type->to_string(to_bytes(val.view()));
             }
-        },
-        [](const auto&) {}
-    }, _restrictions->get_where_clause());
+        }
+    }
 
     if (match_query.empty()) {
         co_await coroutine::return_exception(exceptions::invalid_request_exception(
@@ -2371,15 +2480,19 @@ fts_indexed_table_select_statement::do_execute(
                 "WHERE clause"));
     }
 
+    // Qualify the user query with the indexed field name so Tantivy's query
+    // parser can resolve it.  Wrapping in parentheses preserves compound
+    // expressions: `body:(quick OR brown)` rather than `body:quick OR brown`.
+    const sstring tantivy_query = format("{}:({})",
+            _match_column->name_as_text(), match_query);
+
     auto timeout = db::timeout_clock::now() + get_timeout(state.get_client_state(), options);
 
-    // Delegate to the FTS CDC consumer running on the alien thread.
-    // The consumer lives on `this_shard()` — no cross-shard dispatch needed.
-    auto& consumer = qp.db().as_sharded().local().fts_consumer();
-    auto hits = co_await consumer.search(
-            keyspace(), column_family(),
+    auto hits = co_await qp.fts_cdc().search(
+            keyspace(),
+            column_family(),
             _fts_index.metadata().name(),
-            match_query,
+            tantivy_query,
             static_cast<uint32_t>(limit));
 
     if (hits.empty()) {
@@ -2405,20 +2518,35 @@ fts_indexed_table_select_statement::do_execute(
     }
 
     // Build dht::decorated_key list from the hit IDs.
-    // Hit IDs have the format "<pk_hex>" or "<pk_hex>:<ck_hex>".
-    // We reconstruct partition keys from the hex-encoded bytes.
+    // Hit IDs have the format "<pk_part>" or "<pk_part>|<ck_part>".
+    // '|' separates the partition-key part from the clustering-key part;
+    // ':' separates individual components within a multi-column key.
+    // We reconstruct partition/clustering keys from the hex-encoded components.
     auto cmd = prepare_command_for_base_query(qp, state, options, hits.size());
+
+    // Helper: split a hex part on ':' and decode each component into bytes.
+    auto decode_key_components = [](const sstring& hex_part) -> std::vector<bytes> {
+        std::vector<bytes> comps;
+        sstring rem = hex_part;
+        while (!rem.empty()) {
+            auto colon = rem.find(':');
+            sstring comp_hex = (colon == sstring::npos) ? rem : rem.substr(0, colon);
+            comps.push_back(from_hex(comp_hex));
+            if (colon == sstring::npos) break;
+            rem = rem.substr(colon + 1);
+        }
+        return comps;
+    };
 
     if (_schema->clustering_key_size() == 0) {
         // No clustering key — use the partition-range fetch path.
         std::vector<dht::partition_range> partition_ranges;
         partition_ranges.reserve(hits.size());
         for (const auto& [hit_id, _score] : hits) {
-            sstring pk_hex = hit_id;
-            // Decode hex → bytes → partition key.
-            auto pk_bytes = from_hex(pk_hex);
+            // hit_id is the full pk_part (no '|' present).
+            // Decode each ':'-separated component and reconstruct the key.
             auto pk = partition_key::from_exploded(
-                    *_schema, {bytes_view{pk_bytes}});
+                    *_schema, decode_key_components(hit_id));
             auto dk = dht::decorate_key(*_schema, pk);
             partition_ranges.push_back(
                     dht::partition_range::make_singular(std::move(dk)));
@@ -2432,23 +2560,22 @@ fts_indexed_table_select_statement::do_execute(
     std::vector<vector_search::primary_key> pkeys;
     pkeys.reserve(hits.size());
     for (const auto& [hit_id, _score] : hits) {
-        // Split on ':' to get pk_hex and ck_hex parts.
-        auto colon = hit_id.find(':');
-        sstring pk_hex = (colon == sstring::npos)
-                ? hit_id : hit_id.substr(0, colon);
-        sstring ck_hex = (colon == sstring::npos)
-                ? sstring{} : hit_id.substr(colon + 1);
+        // Split on '|' to separate the pk_part from the ck_part.
+        // Within each part, ':' separates multi-component key columns.
+        auto pipe = hit_id.find('|');
+        sstring pk_part = (pipe == sstring::npos)
+                ? hit_id : hit_id.substr(0, pipe);
+        sstring ck_part = (pipe == sstring::npos)
+                ? sstring{} : hit_id.substr(pipe + 1);
 
-        auto pk_bytes = from_hex(pk_hex);
         auto pk = partition_key::from_exploded(
-                *_schema, {bytes_view{pk_bytes}});
+                *_schema, decode_key_components(pk_part));
         auto dk = dht::decorate_key(*_schema, pk);
 
         clustering_key_prefix ck = clustering_key_prefix::make_empty();
-        if (!ck_hex.empty()) {
-            auto ck_bytes = from_hex(ck_hex);
+        if (!ck_part.empty()) {
             ck = clustering_key_prefix::from_exploded(
-                    *_schema, {bytes_view{ck_bytes}});
+                    *_schema, decode_key_components(ck_part));
         }
         pkeys.push_back({std::move(dk), std::move(ck)});
     }
@@ -2552,13 +2679,16 @@ static std::optional<fts_query_info> get_fts_query_info(
     // Step 1: check the raw WHERE clause for a MATCH binary operator.
     // We must do this first — if there is no MATCH predicate this is not an
     // FTS query at all, even if the table happens to have an FTS index.
+    logger.debug("get_fts_query_info: checking where_clause for MATCH operator");
     const expr::binary_operator* match_binop = expr::find_binop(where_clause,
             [](const expr::binary_operator& bo) {
                 return bo.op == expr::oper_t::MATCH;
             });
     if (!match_binop) {
+        logger.debug("get_fts_query_info: no MATCH operator found in where_clause, returning nullopt");
         return std::nullopt;
     }
+    logger.debug("get_fts_query_info: found MATCH operator");
 
     // Step 2: extract the column name from the LHS of the MATCH operator.
     // The LHS is still an unresolved_identifier at this point because we are
@@ -2580,6 +2710,7 @@ static std::optional<fts_query_info> get_fts_query_info(
         throw exceptions::invalid_request_exception(
                 fmt::format("Unknown column '{}' in FTS MATCH predicate", match_col_name));
     }
+    logger.debug("get_fts_query_info: MATCH column = '{}'", match_col_name);
 
     // Step 3: find an FTS custom index on the target column.
     // We use the same dynamic_cast pattern as has_fts_index_on_column() in
@@ -2587,6 +2718,7 @@ static std::optional<fts_query_info> get_fts_query_info(
     auto cf = db.find_column_family(schema);
     auto& sim = cf.get_index_manager();
     auto indexes = sim.list_indexes();
+    logger.debug("get_fts_query_info: found {} indexes on table", indexes.size());
 
     auto it = std::find_if(indexes.begin(), indexes.end(),
             [&match_col_name](const secondary_index::index& idx) {
@@ -2594,29 +2726,37 @@ static std::optional<fts_query_info> get_fts_query_info(
         // Verify this is an FTS custom index via factory + dynamic_cast.
         auto class_it = opts.find(db::index::secondary_index::custom_class_option_name);
         if (class_it == opts.end()) {
+            logger.debug("  index '{}': no class_name option", idx.metadata().name());
             return false;
         }
+        logger.debug("  index '{}': class_name='{}'", idx.metadata().name(), class_it->second);
         auto factory = secondary_index::secondary_index_manager::get_custom_class_factory(class_it->second);
         if (!factory) {
+            logger.debug("  index '{}': no factory for class '{}'", idx.metadata().name(), class_it->second);
             return false;
         }
         auto instance = (*factory)();
-        if (!dynamic_cast<fts_index*>(instance.get())) {
+        if (!dynamic_cast<db::index::fts_index*>(instance.get())) {
+            logger.debug("  index '{}': not an fts_index", idx.metadata().name());
             return false;
         }
         // Verify the index targets the column named in the MATCH predicate.
         auto target_it = opts.find(cql3::statements::index_target::target_option_name);
         if (target_it == opts.end()) {
+            logger.debug("  index '{}': no target option", idx.metadata().name());
             return false;
         }
+        logger.debug("  index '{}': target='{}' match_col='{}'", idx.metadata().name(), target_it->second, match_col_name);
         return target_it->second.find(match_col_name) != sstring::npos;
     });
 
     if (it == indexes.end()) {
         // No FTS index on the column referenced by MATCH → not an FTS query.
         // Let the normal restriction path handle this (it will likely error).
+        logger.debug("get_fts_query_info: no FTS index found for column '{}', returning nullopt", match_col_name);
         return std::nullopt;
     }
+    logger.debug("get_fts_query_info: found FTS index '{}' for column '{}'", it->metadata().name(), match_col_name);
 
     return fts_query_info{*it, match_col};
 }
@@ -2785,7 +2925,7 @@ std::unique_ptr<prepared_statement> select_statement::prepare(data_dictionary::d
         throw exceptions::invalid_request_exception("PER PARTITION LIMIT is not allowed with aggregate queries.");
     }
 
-    auto restrictions = prepare_restrictions(db, schema, ctx, selection, for_view, _parameters->allow_filtering() || is_ann_query,
+    auto restrictions = prepare_restrictions(db, schema, ctx, selection, for_view, _parameters->allow_filtering() || is_ann_query || is_fts_query,
             restrictions::check_indexes(!_parameters->is_mutation_fragments()));
 
     if (_parameters->is_distinct()) {
@@ -2812,7 +2952,7 @@ std::unique_ptr<prepared_statement> select_statement::prepare(data_dictionary::d
     }
 
     std::vector<sstring> warnings;
-    if (!is_ann_query) {
+    if (!is_ann_query && !is_fts_query) {
         check_needs_filtering(*restrictions, db.get_config().strict_allow_filtering(), warnings);
         ensure_filtering_columns_retrieval(db, *selection, *restrictions);
     }

@@ -37,8 +37,13 @@
 #include "fts/fts_cdc_consumer.hh"
 
 #include <chrono>
+#include <condition_variable>
+#include <filesystem>
+#include <mutex>
+#include <queue>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <seastar/core/alien.hh>
@@ -54,7 +59,9 @@
 #include "cql3/query_processor.hh"
 #include "cql3/untyped_result_set.hh"
 #include "db_clock.hh"
+#include "dht/token.hh"
 #include "index/fts_index.hh"
+#include "index/secondary_index.hh"
 #include "index/secondary_index_manager.hh"
 #include "mutation/timestamp.hh"
 #include "replica/database.hh"
@@ -90,27 +97,104 @@ static constexpr uint32_t DEFAULT_SEARCH_LIMIT = 10'000;
 // Alien thread runner
 // =========================================================================
 //
-// A thin wrapper around std::thread that executes blocking Tantivy FFI calls
-// without stalling the Seastar reactor.  One instance per shard guarantees
-// that the ShardIndex — which is NOT Send across threads — is always touched
-// from the same alien thread.
+// A dedicated std::thread with a work queue that executes blocking Tantivy
+// FFI calls without stalling the Seastar reactor.  One instance per shard
+// guarantees that the ShardIndex — which is NOT Send across threads — is
+// always touched from the same OS thread.
+//
+// Design:
+//   - Constructor creates the worker std::thread immediately.
+//   - Destructor sets the stop flag and joins the thread.
+//   - run(fn) enqueues a work item, returns a seastar::future<R>.
+//   - The worker thread executes fn(), then posts the result back to the
+//     originating Seastar shard via seastar::alien::run_on(), which posts
+//     the promise fulfillment onto the reactor's message queue without
+//     allocating a Seastar fiber stack.
 class alien_thread_runner {
 public:
-    alien_thread_runner() = default;
-    ~alien_thread_runner() = default;
+    alien_thread_runner() {
+        _thread = std::thread([this] { work_loop(); });
+    }
 
-    /// Run `fn` on the alien thread and return a future that resolves when
-    /// the call completes.  `fn` must be callable with no arguments and must
-    /// not capture Seastar futures or promises.
+    ~alien_thread_runner() {
+        {
+            std::lock_guard<std::mutex> lk(_mutex);
+            _stop = true;
+        }
+        _cv.notify_one();
+        _thread.join();
+    }
+
+    /// Enqueue `fn` for execution on the dedicated alien thread and return a
+    /// future that resolves on the calling Seastar shard when `fn` completes.
+    /// `fn` may block (e.g. Tantivy disk I/O); it must not capture Seastar
+    /// coroutine handles or futures.
     template <typename Fn>
     seastar::future<std::invoke_result_t<Fn>> run(Fn fn) {
-        // seastar::alien::run_on dispatches work to an alien thread and
-        // returns a future resolved back on the calling Seastar shard.
-        return seastar::alien::run_on(
-                *seastar::alien::internal::default_instance,
-                seastar::this_shard_id(),
-                std::move(fn));
+        using R = std::invoke_result_t<Fn>;
+        seastar::promise<R> pr;
+        auto fut = pr.get_future();
+        const unsigned shard = seastar::this_shard_id();
+
+        auto task = [fn = std::move(fn), pr = std::move(pr), shard]() mutable {
+            if constexpr (std::is_void_v<R>) {
+                std::exception_ptr ep;
+                try { fn(); } catch (...) { ep = std::current_exception(); }
+                seastar::alien::run_on(
+                    *seastar::alien::internal::default_instance, shard,
+                    [pr = std::move(pr), ep = std::move(ep)]() mutable noexcept {
+                        if (ep) {
+                            try { pr.set_exception(std::move(ep)); } catch (...) {}
+                        } else {
+                            try { pr.set_value(); } catch (...) {}
+                        }
+                    });
+            } else {
+                std::optional<R> result;
+                std::exception_ptr ep;
+                try { result = fn(); } catch (...) { ep = std::current_exception(); }
+                seastar::alien::run_on(
+                    *seastar::alien::internal::default_instance, shard,
+                    [pr = std::move(pr), result = std::move(result), ep = std::move(ep)]() mutable noexcept {
+                        if (ep) {
+                            try { pr.set_exception(std::move(ep)); } catch (...) {}
+                        } else {
+                            try { pr.set_value(std::move(*result)); } catch (...) {}
+                        }
+                    });
+            }
+        };
+
+        {
+            std::lock_guard<std::mutex> lk(_mutex);
+            _queue.push(std::move(task));
+        }
+        _cv.notify_one();
+        return fut;
     }
+
+private:
+    void work_loop() {
+        for (;;) {
+            std::move_only_function<void()> task;
+            {
+                std::unique_lock<std::mutex> lk(_mutex);
+                _cv.wait(lk, [this] { return _stop || !_queue.empty(); });
+                if (_stop && _queue.empty()) {
+                    return;
+                }
+                task = std::move(_queue.front());
+                _queue.pop();
+            }
+            task();
+        }
+    }
+
+    std::thread _thread;
+    std::mutex _mutex;
+    std::condition_variable _cv;
+    std::queue<std::move_only_function<void()>> _queue;
+    bool _stop{false};
 };
 
 // =========================================================================
@@ -120,22 +204,28 @@ public:
 // Hex-encode a bytes_view for use as a document-id component.
 static sstring hex_encode(bytes_view bv) {
     static const char hex[] = "0123456789abcdef";
-    sstring result;
+    std::string result;
     result.reserve(bv.size() * 2);
     for (uint8_t b : bv) {
         result += hex[b >> 4];
         result += hex[b & 0x0f];
     }
-    return result;
+    return sstring(result);
 }
 
 // Build a doc_id string from serialised partition key bytes and (optionally)
 // clustering key bytes.
-static sstring make_doc_id(bytes_view pk, bytes_view ck) {
+// Doc-ID format:
+//   - Tables WITHOUT clustering columns: "<pk_hex>"
+//   - Tables WITH clustering columns:    "<pk_hex>|<ck_hex>"
+// '|' (0x7C) separates the partition-key part from the clustering-key part.
+// ':' separates individual components within a multi-column partition or
+// clustering key.  '|' is not a hex character so the split is unambiguous.
+[[maybe_unused]] static sstring make_doc_id(bytes_view pk, bytes_view ck) {
     if (ck.empty()) {
         return hex_encode(pk);
     }
-    return hex_encode(pk) + ":" + hex_encode(ck);
+    return hex_encode(pk) + "|" + hex_encode(ck);
 }
 
 // Convert a CDC `cdc$time` timeuuid column to microseconds since epoch.
@@ -158,8 +248,9 @@ static std::optional<::fts::FieldValue> extract_field_value(
 {
     const sstring col_name = cdef.name_as_text();
 
-    // NULL in a CDC row means the column was not present in the mutation.
-    if (!row.has(col_name) || row.is_null(col_name)) {
+    // NULL in a CDC row means the column was not present in the mutation,
+    // or was explicitly set to NULL (e.g. a tombstone).
+    if (!row.has(col_name)) {
         return std::nullopt;
     }
 
@@ -231,22 +322,22 @@ static std::optional<::fts::FieldValue> extract_field_value(
         case abstract_type::kind::uuid:
         case abstract_type::kind::timeuuid: {
             fv.kind    = "string";
-            fv.str_val = row.get_as<utils::UUID>(col_name).to_sstring().c_str();
+            fv.str_val = fmt::format("{}", row.get_as<utils::UUID>(col_name)).c_str();
             fv.i64_val = 0;
             fv.f64_val = 0.0;
             return fv;
         }
         case abstract_type::kind::inet: {
             fv.kind    = "ip";
-            // net::inet_address::to_sstring() returns dotted notation.
-            fv.str_val = row.get_as<net::inet_address>(col_name)
-                             .to_sstring().c_str();
+            // fmt::format("{}", addr) returns dotted/colon notation.
+            fv.str_val = fmt::format("{}", row.get_as<net::inet_address>(col_name))
+                             .c_str();
             fv.i64_val = 0;
             fv.f64_val = 0.0;
             return fv;
         }
         case abstract_type::kind::bytes: {
-            auto raw = row.get_blob(col_name);
+            auto raw = row.get_blob_unfragmented(col_name);
             fv.kind    = "bytes";
             fv.str_val = hex_encode(raw).c_str();
             fv.i64_val = 0;
@@ -256,7 +347,7 @@ static std::optional<::fts::FieldValue> extract_field_value(
         case abstract_type::kind::decimal:
         case abstract_type::kind::varint: {
             // Represent as serialised string for exact-match indexing.
-            auto raw = row.get_blob(col_name);
+            auto raw = row.get_blob_unfragmented(col_name);
             fv.kind    = "string";
             fv.str_val = hex_encode(raw).c_str();
             fv.i64_val = 0;
@@ -268,7 +359,7 @@ static std::optional<::fts::FieldValue> extract_field_value(
         case abstract_type::kind::set:
         case abstract_type::kind::user: {
             // JSON fallback for complex types.
-            auto raw = row.get_blob(col_name);
+            auto raw = row.get_blob_unfragmented(col_name);
             fv.kind    = "json";
             // Provide the raw bytes as a hex string; the Rust side stores
             // it as a JSON string literal.
@@ -287,9 +378,9 @@ static std::optional<::fts::FieldValue> extract_field_value(
 // fts_cdc_consumer — constructor / destructor
 // =========================================================================
 
-fts_cdc_consumer::fts_cdc_consumer(cql3::query_processor& qp, replica::database& db)
-    : _qp{qp}
-    , _db{db}
+fts_cdc_consumer::fts_cdc_consumer(seastar::sharded<cql3::query_processor>& qp, seastar::sharded<replica::database>& db)
+    : _qp{qp.local()}
+    , _db{db.local()}
     , _alien{std::make_unique<alien_thread_runner>()}
 {
 }
@@ -303,13 +394,15 @@ fts_cdc_consumer::~fts_cdc_consumer() = default;
 seastar::future<> fts_cdc_consumer::start() {
     // Open indexes for every table that already has an FTS index at startup.
     // This covers the restart-with-existing-index case.
-    for (auto& [ks_name, ks] : _db.get_keyspaces()) {
-        for (auto& [cf_name, cf] : ks.column_families()) {
-            auto s = cf->schema();
-            if (db::index::fts_index::has_fts_index(*s)) {
-                co_await open_indexes_for_table(s);
-            }
+    std::vector<schema_ptr> schemas_to_open;
+    _db.get_tables_metadata().for_each_table([&](table_id, lw_shared_ptr<replica::table> t) {
+        auto s = t->schema();
+        if (db::index::fts_index::has_fts_index(*s)) {
+            schemas_to_open.push_back(s);
         }
+    });
+    for (auto& s : schemas_to_open) {
+        co_await open_indexes_for_table(s);
     }
 
     // Arm the periodic poll timer.
@@ -383,7 +476,7 @@ seastar::future<> fts_cdc_consumer::open_indexes_for_table(schema_ptr s) {
     // index's OPTIONS at CREATE INDEX time.
     for (const auto& idx_meta : s->indices()) {
         auto class_it = idx_meta.options().find(
-                secondary_index::secondary_index_manager::custom_class_option_name);
+                db::index::secondary_index::custom_class_option_name);
         if (class_it == idx_meta.options().end()) {
             continue;
         }
@@ -399,53 +492,68 @@ seastar::future<> fts_cdc_consumer::open_indexes_for_table(schema_ptr s) {
 
         const sstring& idx_name = idx_meta.name();
 
-        // Build the field-mapping descriptor from the schema columns so we
-        // can reconstruct the Tantivy schema after a restart even if the
-        // OPTIONS["field_mapping"] key is absent (e.g. older snapshot).
-        auto field_mapping_json = db::index::fts_index::build_field_mapping_json(
-                *s, {}, idx_meta.options());
+        // Skip if this specific index is already open on this shard.
+        if (auto ts_it = _tables.find(tid);
+                ts_it != _tables.end() && ts_it->second.indexes.contains(idx_name)) {
+            continue;
+        }
 
-        // Parse the JSON array into FieldMapping structs.
-        // The JSON format is: [{"name":"col","kind":"text","tokenizer":"","multi_valued":false}, …]
-        // We do a minimal parse here; full JSON support added via serde on
-        // the Rust side.
+        // Build FieldMapping structs directly from the schema's regular
+        // columns.  We map every FTS-indexable column; per-column tokenizer
+        // overrides are taken from OPTIONS (e.g. 'body.tokenizer': 'en_stem').
         std::vector<::fts::FieldMapping> mappings;
-        // TODO: replace with a proper JSON parser (nlohmann or rapidjson).
-        // For now, forward the raw JSON string as a single "json" field.
-        // The Rust `open_shard_index` / `create_shard_index` functions parse
-        // FieldMapping slices, so we cannot pass raw JSON directly.  This
-        // placeholder ensures compilation; a proper JSON → FieldMapping
-        // deserialiser must be wired before integration tests.
-        (void)field_mapping_json;
+        for (const auto& cdef : s->regular_columns()) {
+            const sstring kind = db::index::fts_index::map_cql_type_to_field_kind(*cdef.type);
+            if (kind == "skip" || kind == "udt") {
+                continue;
+            }
+            const sstring col = cdef.name_as_text();
+            const sstring tok_key = col + ".tokenizer";
+            auto tok_it = idx_meta.options().find(tok_key);
+            const sstring tokenizer = (tok_it != idx_meta.options().end())
+                    ? tok_it->second : sstring{};
+            const bool multi_valued =
+                    cdef.type->get_kind() == abstract_type::kind::list ||
+                    cdef.type->get_kind() == abstract_type::kind::set;
+            ::fts::FieldMapping fm;
+            fm.name       = rust::String(col.c_str());
+            fm.kind       = rust::String(kind.c_str());
+            fm.tokenizer  = rust::String(tokenizer.c_str());
+            fm.multi_valued = multi_valued;
+            mappings.push_back(std::move(fm));
+        }
 
-        // Shard-local index path.
-        // TODO: derive from db::config::data_file_directories().
-        sstring idx_path = format("fts_indexes/{}/{}/{}",
-                s->ks_name(), s->cf_name(), idx_name);
+        // Shard-local index path under the first configured data directory.
+        const auto& data_dirs = _db.get_config().data_file_directories();
+        const sstring data_dir = data_dirs.empty() ? "/var/lib/scylla" : data_dirs[0];
+        sstring idx_path = format("{}/fts_indexes/{}/{}/{}",
+                data_dir, s->ks_name(), s->cf_name(), idx_name);
 
         const uint32_t shard_id = seastar::this_shard_id();
 
-        // Run index creation/open on the alien thread.
+        // Run index open (or creation) on the Seastar fiber.
+        // Use filesystem::exists to decide which Tantivy call to make so we
+        // never call create on an existing dir or open on a non-existent one.
         auto result = co_await _alien->run([idx_path, shard_id, &mappings]()
                 -> std::variant<rust::Box<::fts::ShardIndex>, std::string>
         {
+            const bool dir_exists = std::filesystem::exists(idx_path.c_str());
             try {
-                auto idx = ::fts::open_shard_index(
-                        idx_path.c_str(), shard_id,
-                        rust::Slice<const ::fts::FieldMapping>{
-                            mappings.data(), mappings.size()});
-                return std::move(idx);
-            } catch (const std::exception& e) {
-                // Index directory doesn't exist yet — create it.
-                try {
+                if (dir_exists) {
+                    auto idx = ::fts::open_shard_index(
+                            idx_path.c_str(), shard_id,
+                            rust::Slice<const ::fts::FieldMapping>{
+                                mappings.data(), mappings.size()});
+                    return std::move(idx);
+                } else {
                     auto idx = ::fts::create_shard_index(
                             idx_path.c_str(), shard_id,
                             rust::Slice<const ::fts::FieldMapping>{
                                 mappings.data(), mappings.size()});
                     return std::move(idx);
-                } catch (const std::exception& e2) {
-                    return std::string(e2.what());
                 }
+            } catch (const std::exception& e) {
+                return std::string(e.what());
             }
         });
 
@@ -454,6 +562,8 @@ seastar::future<> fts_cdc_consumer::open_indexes_for_table(schema_ptr s) {
                     idx_name, shard_id, std::get<std::string>(result));
             continue;
         }
+
+        ftslog.info("FTS index opened: {}.{}/{} shard={}", s->ks_name(), s->cf_name(), idx_name, shard_id);
 
         auto& ts = _tables[tid];
 
@@ -485,11 +595,32 @@ seastar::future<> fts_cdc_consumer::close_indexes_for_table(table_id tid) {
     _tables.erase(it);
 }
 
+seastar::future<> fts_cdc_consumer::scan_for_new_fts_tables() {
+    std::vector<schema_ptr> to_open;
+    _db.get_tables_metadata().for_each_table([&](table_id tid, lw_shared_ptr<replica::table> t) {
+        auto s = t->schema();
+        if (!db::index::fts_index::has_fts_index(*s)) {
+            return;
+        }
+        // Always pass FTS tables to open_indexes_for_table — it guards against
+        // re-opening already-open indexes internally, and handles the case where
+        // a new index was added to an existing table after the initial scan.
+        to_open.push_back(s);
+    });
+    for (auto& s : to_open) {
+        ftslog.info("FTS scan: opening index for {}.{}", s->ks_name(), s->cf_name());
+        co_await open_indexes_for_table(s);
+    }
+}
+
 // =========================================================================
 // CDC polling
 // =========================================================================
 
 seastar::future<> fts_cdc_consumer::poll_cdc() {
+    co_await scan_for_new_fts_tables();
+
+    std::vector<table_id> stale;
     for (auto& [tid, ts] : _tables) {
         if (_stopping) {
             co_return;
@@ -499,10 +630,14 @@ seastar::future<> fts_cdc_consumer::poll_cdc() {
         try {
             s = _db.find_schema(tid);
         } catch (...) {
-            ftslog.warn("FTS CDC poll: schema not found for table_id {}", tid);
+            ftslog.info("FTS CDC poll: table_id {} no longer exists, removing", tid);
+            stale.push_back(tid);
             continue;
         }
         co_await poll_cdc_table(s->ks_name(), s->cf_name(), tid, ts);
+    }
+    for (auto tid : stale) {
+        _tables.erase(tid);
     }
 }
 
@@ -519,60 +654,108 @@ seastar::future<> fts_cdc_consumer::poll_cdc_table(
     // through newly written CDC rows.  The cdc$time column is a timeuuid;
     // minTimeuuid() / maxTimeuuid() CQL functions let us express timestamp
     // comparisons.
-    const int64_t checkpoint_ms =
-            ts.checkpoint.time_since_epoch().count();
+    // Clamp to epoch so minTimeuuid() never receives a negative timestamp.
+    const int64_t checkpoint_ms = std::max<int64_t>(
+            0, ts.checkpoint.time_since_epoch().count());
 
-    const sstring query = format(
-            "SELECT * FROM \"{}\".\"{}\" WHERE token(cdc$stream_id) >= {} "
-            "AND token(cdc$stream_id) <= {} "
-            "AND cdc$time > minTimeuuid({}) "
-            "LIMIT {} ALLOW FILTERING",
-            keyspace, cdc_table,
-            std::numeric_limits<int64_t>::min(),
-            std::numeric_limits<int64_t>::max(),
-            checkpoint_ms,
-            CDC_BATCH_SIZE);
-
-    // Execute against the local replica — consistency_level::ONE is fine
-    // because we are always reading from the shard that owns the data.
-    ::shared_ptr<cql3::untyped_result_set> rs;
+    // Determine the token ranges to query.  Restricting the scan to the local
+    // node's ranges avoids a full-ring scan and dramatically reduces
+    // cross-shard noise as the CDC log grows.
+    struct token_range_bounds { int64_t start; int64_t end; };
+    std::vector<token_range_bounds> ranges_to_query;
     try {
-        rs = co_await _qp.execute_internal(
-                query, db::consistency_level::ONE,
-                cql3::query_processor::cache_internal::yes);
+        auto& ks = _db.find_keyspace(keyspace);
+        auto erm = ks.get_static_effective_replication_map();
+        auto local_ranges = co_await _db.get_keyspace_local_ranges(std::move(erm));
+        for (const auto& r : local_ranges) {
+            int64_t start = r.start()
+                    ? dht::token::to_int64(r.start()->value())
+                    : std::numeric_limits<int64_t>::min();
+            int64_t end = r.end()
+                    ? dht::token::to_int64(r.end()->value())
+                    : std::numeric_limits<int64_t>::max();
+            ranges_to_query.push_back({start, end});
+        }
     } catch (const std::exception& e) {
-        ftslog.warn("FTS CDC poll query failed for {}.{}: {}", keyspace, table, e.what());
-        co_return;
+        ftslog.warn("FTS CDC poll: could not get local ranges for keyspace '{}': {}; "
+                    "falling back to full-ring scan", keyspace, e.what());
     }
-
-    if (!rs || rs->empty()) {
-        co_return;
+    // Fall back to the full token ring if we could not obtain local ranges.
+    if (ranges_to_query.empty()) {
+        ranges_to_query.push_back({
+            std::numeric_limits<int64_t>::min(),
+            std::numeric_limits<int64_t>::max()
+        });
     }
 
     schema_ptr base_schema = _db.find_schema(tid);
-
     db_clock::time_point latest_ts = ts.checkpoint;
-    for (const auto& row : *rs) {
-        co_await process_cdc_row(base_schema, row, ts);
+    bool any_rows = false;
 
-        // Advance checkpoint to the most recent cdc$time seen.
-        if (row.has("cdc$time")) {
-            auto u = row.get_as<utils::UUID>("cdc$time");
-            uint64_t us = timeuuid_to_us(u);
-            auto tp = db_clock::time_point{
-                db_clock::duration{static_cast<int64_t>(us / 1000)}};
-            if (tp > latest_ts) {
-                latest_ts = tp;
+    for (const auto& range : ranges_to_query) {
+        const sstring query = format(
+                "SELECT * FROM \"{}\".\"{}\" WHERE token(\"cdc$stream_id\") >= {} "
+                "AND token(\"cdc$stream_id\") <= {} "
+                "AND \"cdc$time\" > minTimeuuid({}) "
+                "LIMIT {} ALLOW FILTERING",
+                keyspace, cdc_table,
+                range.start, range.end,
+                checkpoint_ms,
+                CDC_BATCH_SIZE);
+
+        // Execute against the local replica — consistency_level::ONE is fine
+        // because we are always reading from the shard that owns the data.
+        ftslog.debug("FTS CDC poll query: {}", query);
+        ::shared_ptr<cql3::untyped_result_set> rs;
+        try {
+            rs = co_await _qp.execute_internal(
+                    query, db::consistency_level::ONE,
+                    cql3::query_processor::cache_internal::yes);
+        } catch (const std::exception& e) {
+            ftslog.warn("FTS CDC poll query failed for {}.{}: {}", keyspace, table, e.what());
+            continue;
+        }
+
+        if (!rs || rs->empty()) {
+            ftslog.debug("FTS CDC poll: no new rows in {}.{} for range [{},{}] (checkpoint_ms={})",
+                    keyspace, cdc_table, range.start, range.end, checkpoint_ms);
+            continue;
+        }
+
+        any_rows = true;
+        ftslog.info("FTS CDC poll: {} row(s) from {}.{} (range [{},{}])",
+                rs->size(), keyspace, cdc_table, range.start, range.end);
+
+        for (const auto& row : *rs) {
+            co_await process_cdc_row(base_schema, row, ts);
+
+            // Advance checkpoint to the most recent cdc$time seen.
+            if (row.has("cdc$time")) {
+                auto u = row.get_as<utils::UUID>("cdc$time");
+                uint64_t us = timeuuid_to_us(u);
+                auto tp = db_clock::time_point{
+                    db_clock::duration{static_cast<int64_t>(us / 1000)}};
+                if (tp > latest_ts) {
+                    latest_ts = tp;
+                }
             }
         }
     }
+
     ts.checkpoint = latest_ts;
 
-    // Commit the Tantivy shard index after each batch.
+    if (!any_rows) {
+        co_return;
+    }
+
+    // Commit the Tantivy shard index after processing all ranges.
     for (auto& [idx_name, opaque_ptr] : ts.indexes) {
         auto* raw_idx = static_cast<::fts::ShardIndex*>(opaque_ptr.get());
-        co_await _alien->run([raw_idx]() -> void {
-            try { ::fts::commit(*raw_idx); }
+        co_await _alien->run([raw_idx, ks = keyspace, tbl = table]() -> void {
+            try {
+                uint64_t n = ::fts::commit(*raw_idx);
+                ftslog.info("FTS commit {}/{}: {} doc(s) in index", ks, tbl, n);
+            }
             catch (const std::exception& e) {
                 ftslog.warn("FTS commit error: {}", e.what());
             }
@@ -603,8 +786,8 @@ seastar::future<> fts_cdc_consumer::process_cdc_row(
 
     for (const auto& cdef : base_schema->partition_key_columns()) {
         const sstring col = cdef.name_as_text();
-        if (row.has(col) && !row.is_null(col)) {
-            auto raw = row.get_blob(col);
+        if (row.has(col)) {
+            auto raw = row.get_blob_unfragmented(col);
             if (!pk_str.empty()) {
                 pk_str += ":";
             }
@@ -613,8 +796,8 @@ seastar::future<> fts_cdc_consumer::process_cdc_row(
     }
     for (const auto& cdef : base_schema->clustering_key_columns()) {
         const sstring col = cdef.name_as_text();
-        if (row.has(col) && !row.is_null(col)) {
-            auto raw = row.get_blob(col);
+        if (row.has(col)) {
+            auto raw = row.get_blob_unfragmented(col);
             if (!ck_str.empty()) {
                 ck_str += ":";
             }
@@ -622,9 +805,11 @@ seastar::future<> fts_cdc_consumer::process_cdc_row(
         }
     }
 
-    const sstring doc_id   = make_doc_id(bytes_view{
-            reinterpret_cast<const int8_t*>(pk_str.data()), pk_str.size()},
-            bytes_view{reinterpret_cast<const int8_t*>(ck_str.data()), ck_str.size()});
+    // pk_str and ck_str are already single-pass hex-encoded strings.
+    // Build doc_id using '|' as the PK/CK boundary separator and ':' as the
+    // intra-key component separator.  '|' (0x7c) is not a hex character so it
+    // can never appear inside either key part, making the split unambiguous.
+    const sstring doc_id   = ck_str.empty() ? pk_str : (pk_str + "|" + ck_str);
     const sstring part_key = pk_str;
 
     // Determine write timestamp from cdc$time.
@@ -635,7 +820,7 @@ seastar::future<> fts_cdc_consumer::process_cdc_row(
 
     // Determine TTL.
     int64_t expires_at_us = std::numeric_limits<int64_t>::max(); // no TTL
-    if (row.has("cdc$ttl") && !row.is_null("cdc$ttl")) {
+    if (row.has("cdc$ttl")) {
         int64_t ttl_s = row.get_as<int64_t>("cdc$ttl");
         if (ttl_s > 0) {
             expires_at_us = static_cast<int64_t>(writetime_us)
@@ -680,8 +865,12 @@ seastar::future<> fts_cdc_consumer::process_cdc_row(
     }
 
     if (fields.empty()) {
+        ftslog.debug("FTS process_cdc_row: no indexable fields in op={} for doc_id={}", 
+                     static_cast<int>(op), doc_id);
         co_return;
     }
+
+    ftslog.debug("FTS process_cdc_row: upsert doc_id={} fields={}", doc_id, fields.size());
 
     for (auto& [idx_name, opaque_ptr] : ts.indexes) {
         auto* raw_idx = static_cast<::fts::ShardIndex*>(opaque_ptr.get());
@@ -730,10 +919,12 @@ fts_cdc_consumer::search(
 
     auto it = _tables.find(tid);
     if (it == _tables.end()) {
+        ftslog.warn("FTS search: table {}.{} not in _tables (no FTS index open)", keyspace, table);
         co_return std::vector<std::pair<sstring, float>>{};
     }
     auto idx_it = it->second.indexes.find(index_name);
     if (idx_it == it->second.indexes.end()) {
+        ftslog.warn("FTS search: index '{}' not found for {}.{}", index_name, keyspace, table);
         co_return std::vector<std::pair<sstring, float>>{};
     }
 
@@ -765,6 +956,8 @@ fts_cdc_consumer::search(
     }
 
     const auto& resp = *std::get<rust::Box<::fts::FtsSearchResponse>>(result);
+    ftslog.info("FTS search '{}' on {}/{}: {} hits (total={})",
+            query, keyspace, table, resp.hits.size(), resp.total_hits);
     std::vector<std::pair<sstring, float>> hits;
     hits.reserve(resp.hits.size());
     for (const auto& h : resp.hits) {

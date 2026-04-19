@@ -142,7 +142,7 @@ pub fn delete_by_partition_key(index: &mut ShardIndex, partition_key: &str) -> R
     // Because the cache uses doc_id as key (not partition_key), we scan it.
     // This is O(uncommitted.len()) which is bounded by the commit interval.
     index.uncommitted.retain(|doc_id, _| {
-        !doc_id.starts_with(&format!("{}:", partition_key)) && doc_id != partition_key
+        !doc_id.starts_with(&format!("{}|", partition_key)) && doc_id != partition_key
     });
     Ok(())
 }

@@ -413,7 +413,7 @@ bool fts_index::has_fts_index(const schema& s) {
     for (const auto& index : s.indices()) {
         auto it = index.options().find(db::index::secondary_index::custom_class_option_name);
         if (it != index.options().end()) {
-            auto factory = secondary_index::secondary_index_manager::get_custom_class_factory(it->second);
+            auto factory = ::secondary_index::secondary_index_manager::get_custom_class_factory(it->second);
             if (factory) {
                 auto instance = (*factory)();
                 if (dynamic_cast<fts_index*>(instance.get())) {
@@ -432,7 +432,7 @@ bool fts_index::has_fts_index_on_column(const schema& s, const sstring& col) {
         if (class_it == index.options().end() || target_it == index.options().end()) {
             continue;
         }
-        auto factory = secondary_index::secondary_index_manager::get_custom_class_factory(class_it->second);
+        auto factory = ::secondary_index::secondary_index_manager::get_custom_class_factory(class_it->second);
         if (!factory) {
             continue;
         }
@@ -452,7 +452,7 @@ bool fts_index::has_fts_index_on_column(const schema& s, const sstring& col) {
 // Factory
 // =========================================================================
 
-std::unique_ptr<secondary_index::custom_index> fts_index_factory() {
+std::unique_ptr<::secondary_index::custom_index> fts_index_factory() {
     return std::make_unique<fts_index>();
 }
 
