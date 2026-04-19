@@ -133,11 +133,18 @@ public:
 
     /// Execute a full-text search on all shard indexes for the named table
     /// and index.  Returns a merged, score-sorted result list.
+    ///
+    /// `default_field` is the CQL column name passed to the Tantivy
+    /// `QueryParser` as the sole default field.  This allows compound
+    /// boolean queries (`wonder OR builder`) to parse correctly without the
+    /// `field:(expr)` wrapping that Tantivy rejects for non-trivial syntax.
+    /// An empty string falls back to all TEXT-kind fields (multi-column search).
     seastar::future<std::vector<std::pair<sstring, float>>>
     search(const sstring& keyspace,
            const sstring& table,
            const sstring& index_name,
            const sstring& query,
+           const sstring& default_field,
            uint32_t limit);
 
 private:

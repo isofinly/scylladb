@@ -158,9 +158,15 @@ mod ffi {
         // ── Read operations (called from alien thread) ───────────────────
 
         /// Execute a full-text MATCH query.
+        ///
+        /// `default_field` is the CQL column name to use as the sole default
+        /// field for the Tantivy `QueryParser`.  An empty string falls back to
+        /// all TEXT-kind user fields (same behaviour as before this parameter
+        /// was added — useful for multi-field bare searches).
         fn search(
             index: &ShardIndex,
             query: &str,
+            default_field: &str,
             limit: u32,
             offset: u32,
             facet_fields: &[String],
@@ -244,6 +250,7 @@ fn prune_expired(index: &mut ShardIndex) -> anyhow::Result<u64> {
 fn search(
     index: &ShardIndex,
     query: &str,
+    default_field: &str,
     limit: u32,
     offset: u32,
     facet_fields: &[String],
@@ -252,6 +259,7 @@ fn search(
     reader::search(
         index,
         query,
+        default_field,
         limit,
         offset,
         facet_fields,
@@ -354,7 +362,7 @@ mod tests {
         let n = writer::commit(&mut idx).expect("commit must succeed");
         assert_eq!(n, 1, "one document after first commit");
 
-        let resp = reader::search(&idx, "hello", 10, 0, &[], false).expect("search must succeed");
+        let resp = reader::search(&idx, "hello", "body", 10, 0, &[], false).expect("search must succeed");
         assert_eq!(resp.hits.len(), 1, "exactly one hit expected");
         assert_eq!(resp.hits[0].id, "pk1:ck1");
         assert_eq!(resp.hits[0].partition_key, "pk1");
@@ -384,8 +392,8 @@ mod tests {
         }
         writer::commit(&mut idx).unwrap();
 
-        let page0 = reader::search(&idx, "common", 3, 0, &[], false).unwrap();
-        let page1 = reader::search(&idx, "common", 3, 3, &[], false).unwrap();
+        let page0 = reader::search(&idx, "common", "body", 3, 0, &[], false).unwrap();
+        let page1 = reader::search(&idx, "common", "body", 3, 3, &[], false).unwrap();
 
         assert_eq!(page0.hits.len(), 3, "page 0 must have 3 hits");
         assert_eq!(page1.hits.len(), 2, "page 1 must have remaining 2 hits");
@@ -428,8 +436,8 @@ mod tests {
 
         writer::commit(&mut idx).unwrap();
 
-        let r_new = reader::search(&idx, "new", 10, 0, &[], false).unwrap();
-        let r_old = reader::search(&idx, "old", 10, 0, &[], false).unwrap();
+        let r_new = reader::search(&idx, "new", "body", 10, 0, &[], false).unwrap();
+        let r_old = reader::search(&idx, "old", "body", 10, 0, &[], false).unwrap();
 
         assert_eq!(r_new.total_hits, 1, "new version must be present");
         assert_eq!(r_old.total_hits, 0, "old version must not overwrite");
@@ -529,7 +537,7 @@ mod tests {
         // Phase 2: reopen and verify.
         {
             let idx = schema::open_shard_index(path, 0, &mappings).unwrap();
-            let resp = reader::search(&idx, "persistent", 10, 0, &[], false).unwrap();
+            let resp = reader::search(&idx, "persistent", "body", 10, 0, &[], false).unwrap();
             assert_eq!(resp.hits.len(), 1);
             assert_eq!(resp.hits[0].id, "pk:ck");
         }
@@ -571,5 +579,52 @@ mod tests {
         }];
         let result = schema::build_shard_index(path, 0, &mappings);
         assert!(result.is_err(), "invalid field kind must be rejected");
+    }
+
+    /// Boolean OR expression must parse and return both matching documents.
+    ///
+    /// This is the regression test for the root cause: previously the C++ side
+    /// wrapped the query as `field:(wonder OR builder)` which Tantivy's parser
+    /// rejects.  With `default_field` the raw expression is passed directly.
+    #[test]
+    fn test_boolean_or_query() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().to_str().unwrap();
+
+        let mappings = vec![text_mapping("username")];
+        let mut idx = schema::build_shard_index(path, 0, &mappings).unwrap();
+
+        writer::upsert_document(
+            &mut idx,
+            "pk:ck1",
+            "pk",
+            &[text_val("username", "wonderland")],
+            1_000,
+            i64::MAX,
+        )
+        .unwrap();
+        writer::upsert_document(
+            &mut idx,
+            "pk:ck2",
+            "pk",
+            &[text_val("username", "builder")],
+            2_000,
+            i64::MAX,
+        )
+        .unwrap();
+        writer::upsert_document(
+            &mut idx,
+            "pk:ck3",
+            "pk",
+            &[text_val("username", "something_else")],
+            3_000,
+            i64::MAX,
+        )
+        .unwrap();
+        writer::commit(&mut idx).unwrap();
+
+        let resp = reader::search(&idx, "wonderland OR builder", "username", 10, 0, &[], false)
+            .expect("boolean OR query must not fail");
+        assert_eq!(resp.total_hits, 2, "both wonderland and builder must match");
     }
 }

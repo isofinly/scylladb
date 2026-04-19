@@ -27,10 +27,14 @@ use crate::writer::now_micros;
 /// Execute a full-text search against a shard index.
 ///
 /// `query` is a Tantivy query string (supports Lucene-style syntax).
+/// `default_field` is the CQL column name to use as the sole default field
+/// for the `QueryParser`.  If empty, all TEXT-kind user fields are used as
+/// defaults (backwards-compatible behaviour for multi-field bare searches).
 /// Returns a `FtsSearchResponse` box suitable for handing back to C++.
 pub fn search(
     index: &ShardIndex,
     query: &str,
+    default_field: &str,
     limit: u32,
     offset: u32,
     facet_fields: &[String],
@@ -40,14 +44,25 @@ pub fn search(
     let searcher = index.reader.searcher();
 
     // ── Query parsing ───────────────────────────────────────────────────
-    // `QueryParser::for_index` with all TEXT-kind user fields as defaults
-    // ensures that bare queries (e.g. `wireless`) search across all text
-    // columns. Field-prefixed queries (e.g. `brand:Sony`) still work, as
-    // do prefix/fuzzy/phrase/range/boost queries via Tantivy's native syntax.
-    let qp = QueryParser::for_index(&index.index, index.default_text_fields.clone());
-    // Allow leading wildcards for prefix queries like `*foo`.
-    // Disabled by default in Tantivy because it forces a full scan.
-    // TODO: make this configurable via index OPTIONS.
+    // When `default_field` is non-empty, restrict the QueryParser to that
+    // one field.  This mirrors the standalone Rust module pattern:
+    //   QueryParser::for_index(&index, vec![self.field_doc])
+    // and ensures that boolean/phrase expressions like `wonder OR builder`
+    // are parsed correctly without the `field:(...)` wrapping that Tantivy
+    // rejects for compound queries.
+    //
+    // When `default_field` is empty (e.g. a cross-column free-text search),
+    // fall back to all TEXT-kind user fields so bare queries still search
+    // across every text column.
+    let qp_fields: Vec<tantivy::schema::Field> = if default_field.is_empty() {
+        index.default_text_fields.clone()
+    } else {
+        match index.user_fields.get(default_field) {
+            Some((field, _)) => vec![*field],
+            None => index.default_text_fields.clone(),
+        }
+    };
+    let qp = QueryParser::for_index(&index.index, qp_fields);
     let user_query = qp.parse_query(query)?;
 
     // ── TTL filter ──────────────────────────────────────────────────────

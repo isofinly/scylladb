@@ -2480,11 +2480,11 @@ fts_indexed_table_select_statement::do_execute(
                 "WHERE clause"));
     }
 
-    // Qualify the user query with the indexed field name so Tantivy's query
-    // parser can resolve it.  Wrapping in parentheses preserves compound
-    // expressions: `body:(quick OR brown)` rather than `body:quick OR brown`.
-    const sstring tantivy_query = format("{}:({})",
-            _match_column->name_as_text(), match_query);
+    // Pass the raw MATCH string directly to Tantivy's QueryParser and let
+    // the Rust side configure the parser with the correct default field.
+    // Previously the query was wrapped as `field:(expr)`, which Tantivy's
+    // parser rejects for compound boolean expressions like `wonder OR builder`.
+    const sstring& default_field = _match_column->name_as_text();
 
     auto timeout = db::timeout_clock::now() + get_timeout(state.get_client_state(), options);
 
@@ -2492,7 +2492,8 @@ fts_indexed_table_select_statement::do_execute(
             keyspace(),
             column_family(),
             _fts_index.metadata().name(),
-            tantivy_query,
+            match_query,
+            default_field,
             static_cast<uint32_t>(limit));
 
     if (hits.empty()) {

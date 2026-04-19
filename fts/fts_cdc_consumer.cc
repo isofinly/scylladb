@@ -906,6 +906,7 @@ fts_cdc_consumer::search(
         const sstring& table,
         const sstring& index_name,
         const sstring& query,
+        const sstring& default_field,
         uint32_t limit)
 {
     // Resolve the table.
@@ -933,13 +934,14 @@ fts_cdc_consumer::search(
             (limit == 0) ? DEFAULT_SEARCH_LIMIT : limit;
 
     auto result = co_await _alien->run(
-            [raw_idx, query, effective_limit]()
+            [raw_idx, query, default_field, effective_limit]()
             -> std::variant<rust::Box<::fts::FtsSearchResponse>, std::string>
     {
         try {
             auto resp = ::fts::search(
                     *raw_idx,
                     query.c_str(),
+                    default_field.c_str(),
                     effective_limit,
                     /*offset=*/0,
                     rust::Slice<const rust::String>{nullptr, 0},
